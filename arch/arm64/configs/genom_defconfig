@@ -5962,3 +5962,7 @@ CONFIG_MACH_XIAOMI_TRINKET=y
 # Xiaomi board selection
 #
 CONFIG_MACH_XIAOMI_GINKGO=y
+
+# KernelSU-Next (manual hooks, 4.14 non-GKI)
+CONFIG_KSU=y
+CONFIG_KSU_MANUAL_HOOK=y
