@@ -1,0 +1,707 @@
+name: Build kernel (KernelSU-Next)
+
+# ============================================================================
+# ginkgo（Redmi Note 8 Pro / PureCAF 4.14 / MIUI 12.5）一键编译 + 发布
+#
+# 用法：Actions → Build kernel (KernelSU-Next) → Run workflow
+#   - ksu_ref 留空 = 取 KernelSU-Next legacy 分支上最新的 tag（作者已发布版本，推荐），
+#     例如 2026-09 时是 v3.4.0-legacy。分支上还没有 tag 的提交不会被默认使用：
+#     宁可构建失败，也不用未经作者发布/测试的提交。
+#   - 产物是 AnyKernel3 包（Image.gz + boot 的 dtb 段 + dtbo.img，三者同源），
+#     另附 sha256 与 build-info；勾选发布后自动发 Release，说明里含内核 commit、
+#     KernelSU-Next commit/tag/版本号、配套管理器 APK、刷入步骤等。
+#
+# 重要约束（来自 .tmp/KernelSU-Next更新指南.md）：
+#   1) KernelSU-Next 必须是带完整历史的 git 仓库：版本号 = 30000 + 提交数 + 289，
+#      浅克隆 / 无 .git 会让版本号退回 1（manager 会提示不支持）。本工作流完整克隆。
+#   2) 打包必须带 dtb 段与 dtbo.img：MIUI 12.5 的 boot 是 header v2，只换 Image.gz 会开机硬复位。
+#   3) mkdtboimg.py 只能用 python2 跑（scripts/Makefile.lib 里写死 python2），
+#      CI 里用 PyPy 2.7（与本地 .tmp/bin/python2 同一版本）。
+#
+# 提示：本文件在 .github/ 下，仓库 .gitignore 的 `.*` 规则会忽略它，
+#       提交时请用：git add -f .github/workflows/build-kernelsu-next.yml
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: 'KernelSU-Next 引用。留空 = legacy 分支上最新的 tag（作者已发布版本，推荐）；填 legacy = 分支最新提交（可能尚未发布/测试）；也可填具体 tag 或 commit'
+        type: string
+        default: ''
+      publish_release:
+        description: '构建完成后发布到 Release'
+        type: boolean
+        default: true
+      release_tag:
+        description: 'Release tag（留空则自动生成 kernel-ginkgo-KSUNext-<tag>-<版本号>-<日期>）'
+        type: string
+        default: ''
+  push:
+    tags:
+      - 'kernel-*'
+
+concurrency:
+  group: build-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
+  KSU_BRANCH: legacy
+  DEFCONFIG: genom_defconfig
+  ANYKERNEL_REPO: https://github.com/mylove90/AnyKernel3.git
+  ANYKERNEL_BRANCH: ginkgo
+  # 与 repos/repos.ginkgo.json（旧 CI）及 .tmp/build.sh（本地验证过）一致的组合：
+  # AOSP clang r383902b1 + Android GCC 4.9（aarch64 / arm32，CROSS_COMPILE 用）
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r48/clang-r383902b1.tar.gz
+  GCC_URL: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9
+  GCC32_URL: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9
+  GCC_BRANCH: android-11.0.0_r48
+  PYPY_URL: https://downloads.python.org/pypy/pypy2.7-v7.3.20-linux64.tar.bz2
+
+jobs:
+  meta:
+    name: 解析版本信息
+    runs-on: ubuntu-latest
+    outputs:
+      kernel_branch: ${{ steps.info.outputs.kernel_branch }}
+      kernel_commit: ${{ steps.info.outputs.kernel_commit }}
+      kernel_short: ${{ steps.info.outputs.kernel_short }}
+      kernel_subject: ${{ steps.info.outputs.kernel_subject }}
+      kernel_date: ${{ steps.info.outputs.kernel_date }}
+      ksu_ref: ${{ steps.info.outputs.ksu_ref }}
+      ksu_ref_note: ${{ steps.info.outputs.ksu_ref_note }}
+      ksu_commit: ${{ steps.info.outputs.ksu_commit }}
+      ksu_short: ${{ steps.info.outputs.ksu_short }}
+      ksu_commit_date: ${{ steps.info.outputs.ksu_commit_date }}
+      ksu_count: ${{ steps.info.outputs.ksu_count }}
+      ksu_tag: ${{ steps.info.outputs.ksu_tag }}
+      ksu_describe: ${{ steps.info.outputs.ksu_describe }}
+      ksu_tag_exact: ${{ steps.info.outputs.ksu_tag_exact }}
+      ksu_since_tag: ${{ steps.info.outputs.ksu_since_tag }}
+      ksu_version: ${{ steps.info.outputs.ksu_version }}
+      manager_tag: ${{ steps.info.outputs.manager_tag }}
+      manager_apk: ${{ steps.info.outputs.manager_apk }}
+      manager_apk_spoofed: ${{ steps.info.outputs.manager_apk_spoofed }}
+      manager_version: ${{ steps.info.outputs.manager_version }}
+      manager_min_kernel: ${{ steps.info.outputs.manager_min_kernel }}
+      date: ${{ steps.info.outputs.date }}
+      release_tag: ${{ steps.info.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 解析 KernelSU-Next / 管理器 / 内核版本
+        id: info
+        env:
+          KSU_REF_IN: ${{ inputs.ksu_ref }}
+          RELEASE_TAG_IN: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          out() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+
+          KSU_REF_IN="${KSU_REF_IN:-}"
+
+          # ---- KernelSU-Next：解析引用并算出内核会内嵌的版本号 ----
+          # 完整克隆（不用 --depth）：KSU 版本号取自 git 提交数，浅克隆会得到错误版本号
+          git clone --filter=blob:none --no-checkout "$KSU_REPO" /tmp/ksu
+          cd /tmp/ksu
+          if [ -z "$KSU_REF_IN" ]; then
+            # 留空：取该分支上最新的 tag（作者已发布/测试过的版本），而不是分支最新提交
+            if REF=$(git describe --tags --abbrev=0 "origin/${KSU_BRANCH}^{commit}" 2>/dev/null) && [ -n "$REF" ]; then
+              KSU_REF_USED="$REF"
+              RESOLVE_NOTE="留空 → 自动取 ${KSU_BRANCH} 分支上最新的 tag（作者已发布版本）"
+            else
+              echo "错误: ${KSU_BRANCH} 分支上找不到任何 tag。为避免使用未经作者发布/测试的提交，请显式指定 ksu_ref。" >&2
+              exit 1
+            fi
+          elif git rev-parse --verify --quiet "origin/${KSU_REF_IN}^{commit}" >/dev/null 2>&1; then
+            REF="origin/${KSU_REF_IN}"
+            KSU_REF_USED="$KSU_REF_IN"
+            RESOLVE_NOTE="分支 ${KSU_REF_IN} 的最新提交（可能尚未打 tag，未经作者发布）"
+          elif git rev-parse --verify --quiet "${KSU_REF_IN}^{commit}" >/dev/null 2>&1; then
+            REF="${KSU_REF_IN}"
+            KSU_REF_USED="$KSU_REF_IN"
+            RESOLVE_NOTE="显式指定的 tag / commit"
+          else
+            echo "错误: 在 KernelSU-Next 里找不到引用 '${KSU_REF_IN}'" >&2
+            exit 1
+          fi
+          KSU_COMMIT=$(git rev-parse "${REF}^{commit}")
+          KSU_SHORT=$(git rev-parse --short=8 "${REF}^{commit}")
+          KSU_COMMIT_DATE=$(git show -s --format=%cs "${REF}^{commit}")
+          KSU_COUNT=$(git rev-list --count "${REF}^{commit}")
+          KSU_TAG=$(git describe --tags --abbrev=0 "${REF}^{commit}" 2>/dev/null || true)
+          KSU_DESC=$(git describe --tags "${REF}^{commit}" 2>/dev/null || echo "$KSU_SHORT")
+          if [ -n "$KSU_TAG" ] && [ "$(git rev-parse "${KSU_TAG}^{commit}")" = "$KSU_COMMIT" ]; then
+            KSU_TAG_EXACT=yes
+          else
+            KSU_TAG_EXACT=no
+          fi
+          if [ -n "$KSU_TAG" ]; then
+            KSU_SINCE_TAG=$(git rev-list --count "${KSU_TAG}..${REF}^{commit}")
+          else
+            KSU_TAG="（无）"
+            KSU_SINCE_TAG="unknown"
+          fi
+          # 与 KernelSU-Next/kernel/Kbuild 完全相同的公式；编译日志里会再核对一次
+          KSU_VERSION=$((30000 + KSU_COUNT + 289))
+          KSU_TAG_SLUG=$(printf '%s' "$KSU_TAG" | sed -e 's|[^A-Za-z0-9._-]|-|g')
+
+          # ---- 最新管理器（release）与它要求的最低内核版本 ----
+          MANAGER_JSON=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/releases/latest" || true)
+          MANAGER_TAG=$(printf '%s' "$MANAGER_JSON" | jq -r '.tag_name // ""' 2>/dev/null || true)
+          MANAGER_APK=$(printf '%s' "$MANAGER_JSON" | jq -r '[.assets[].name | select(endswith("-release.apk")) | select(contains("spoofed") | not)] | first // ""' 2>/dev/null || true)
+          MANAGER_APK_SPOOFED=$(printf '%s' "$MANAGER_JSON" | jq -r '[.assets[].name | select(endswith("-release.apk")) | select(contains("spoofed"))] | first // ""' 2>/dev/null || true)
+          MANAGER_VERSION=$(printf '%s' "$MANAGER_APK" | grep -oE '_[0-9]+-release\.apk$' | tr -dc '0-9' || true)
+          MANAGER_MIN=""
+          if [ -n "$MANAGER_TAG" ]; then
+            MANAGER_MIN=$(git show "${MANAGER_TAG}:manager/app/src/main/java/com/rifsxd/ksunext/Natives.kt" 2>/dev/null \
+              | grep -oE 'MINIMAL_SUPPORTED_KERNEL = [0-9]+' | grep -oE '[0-9]+' | head -n1 || true)
+          fi
+          [ -n "$MANAGER_MIN" ] || MANAGER_MIN=33188
+
+          # ---- 内核信息 ----
+          cd "$GITHUB_WORKSPACE"
+          KERNEL_COMMIT=$(git rev-parse HEAD)
+          KERNEL_SHORT=$(git rev-parse --short=12 HEAD)
+          KERNEL_SUBJECT=$(git show -s --format=%s HEAD)
+          KERNEL_DATE=$(git show -s --format=%cs HEAD)
+          KERNEL_BRANCH="${GITHUB_REF_NAME}"
+          DATE=$(date -u +%Y%m%d)
+
+          RELEASE_TAG="${RELEASE_TAG_IN:-}"
+          if [ -z "$RELEASE_TAG" ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+              RELEASE_TAG="${GITHUB_REF_NAME}"
+            else
+              RELEASE_TAG="kernel-ginkgo-KSUNext-${KSU_TAG_SLUG}-${KSU_VERSION}-${DATE}"
+            fi
+          fi
+
+          out kernel_branch "$KERNEL_BRANCH"
+          out kernel_commit "$KERNEL_COMMIT"
+          out kernel_short "$KERNEL_SHORT"
+          out kernel_subject "$KERNEL_SUBJECT"
+          out kernel_date "$KERNEL_DATE"
+          out ksu_ref "$KSU_REF_USED"
+          out ksu_ref_note "$RESOLVE_NOTE"
+          out ksu_commit "$KSU_COMMIT"
+          out ksu_short "$KSU_SHORT"
+          out ksu_commit_date "$KSU_COMMIT_DATE"
+          out ksu_count "$KSU_COUNT"
+          out ksu_tag "$KSU_TAG"
+          out ksu_describe "$KSU_DESC"
+          out ksu_tag_exact "$KSU_TAG_EXACT"
+          out ksu_since_tag "$KSU_SINCE_TAG"
+          out ksu_version "$KSU_VERSION"
+          out manager_tag "$MANAGER_TAG"
+          out manager_apk "$MANAGER_APK"
+          out manager_apk_spoofed "$MANAGER_APK_SPOOFED"
+          out manager_version "$MANAGER_VERSION"
+          out manager_min_kernel "$MANAGER_MIN"
+          out date "$DATE"
+          out release_tag "$RELEASE_TAG"
+
+          {
+            echo "### 版本信息"
+            echo "- 内核：\`${KERNEL_SHORT}\` ${KERNEL_SUBJECT}（${KERNEL_DATE}，${KERNEL_BRANCH}）"
+            echo "- KernelSU-Next 引用：${RESOLVE_NOTE} → \`${KSU_REF_USED}\`"
+            echo "- KernelSU-Next：\`${KSU_DESC}\`（commit \`${KSU_SHORT}\`；正好是 tag：${KSU_TAG_EXACT}；落后 tag ${KSU_SINCE_TAG} 个提交）"
+            echo "- KSU 版本号（预计）：**${KSU_VERSION}**（= 30000 + ${KSU_COUNT} + 289）"
+            echo "- 管理器：\`${MANAGER_TAG}\` / \`${MANAGER_APK}\`（最低内核版本 ${MANAGER_MIN}）"
+            echo "- Release tag：\`${RELEASE_TAG}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: 编译内核（ginkgo · KernelSU-Next）
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    outputs:
+      zip: ${{ steps.pack.outputs.zip }}
+      ksu_tag: ${{ steps.verify.outputs.tag }}
+      ksu_version: ${{ steps.verify.outputs.version }}
+      kernel_release: ${{ steps.verify.outputs.kernel_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 打印本次构建信息
+        run: |
+          echo "内核 commit : ${{ needs.meta.outputs.kernel_short }} (${{ needs.meta.outputs.kernel_subject }})"
+          echo "内核分支    : ${{ needs.meta.outputs.kernel_branch }}"
+          echo "KSU-Next    : ${{ needs.meta.outputs.ksu_describe }} -> ${{ needs.meta.outputs.ksu_commit }}"
+          echo "KSU 版本号  : ${{ needs.meta.outputs.ksu_version }}（预计，编译日志为准）"
+          echo "Release tag : ${{ needs.meta.outputs.release_tag }}"
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          df -h /
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev zip unzip cpio rsync wget curl perl ccache
+          ccache -M 4G
+          ccache -z
+      - name: 缓存 clang（r383902b1）
+        id: clang_cache
+        uses: actions/cache@v4
+        with:
+          path: toolchains/clang
+          key: aosp-clang-r383902b1-v1
+      - name: 下载 clang（缓存未命中时）
+        if: steps.clang_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains/clang
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/clang.tar.gz "$CLANG_URL"
+          tar -xzf /tmp/clang.tar.gz -C toolchains/clang
+          rm -f /tmp/clang.tar.gz
+          toolchains/clang/bin/clang --version | head -n1
+      - name: 缓存 GCC 4.9（aarch64 + arm32）
+        id: gcc_cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchains/gcc
+            toolchains/gcc32
+          key: android-gcc-4.9-${{ env.GCC_BRANCH }}-v1
+      - name: 下载 GCC 4.9（缓存未命中时）
+        if: steps.gcc_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          rm -rf toolchains/gcc toolchains/gcc32
+          git clone --depth=1 --branch "$GCC_BRANCH" "$GCC_URL" toolchains/gcc
+          git clone --depth=1 --branch "$GCC_BRANCH" "$GCC32_URL" toolchains/gcc32
+      - name: 缓存 PyPy 2.7（给 mkdtboimg.py 用的 python2）
+        id: pypy_cache
+        uses: actions/cache@v4
+        with:
+          path: toolchains/pypy
+          key: pypy2.7-v7.3.20-linux64-v1
+      - name: 下载 PyPy 2.7（缓存未命中时）
+        if: steps.pypy_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains/pypy
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/pypy.tar.bz2 "$PYPY_URL"
+          tar -xjf /tmp/pypy.tar.bz2 -C toolchains/pypy
+          rm -f /tmp/pypy.tar.bz2
+      - name: 缓存 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ginkgo-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-ginkgo-
+      - name: 配置 PATH 与 python2
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains/bin
+          ln -sf "$GITHUB_WORKSPACE/toolchains/pypy/pypy2.7-v7.3.20-linux64/bin/pypy" toolchains/bin/python2
+          echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchains/gcc/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchains/gcc32/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchains/bin" >> "$GITHUB_PATH"
+          "$GITHUB_WORKSPACE/toolchains/clang/bin/clang" --version | head -n1
+          "$GITHUB_WORKSPACE/toolchains/bin/python2" --version
+      - name: 同步 KernelSU-Next（完整历史，供版本号计算）
+        env:
+          KSU_COMMIT: ${{ needs.meta.outputs.ksu_commit }}
+        run: |
+          set -euo pipefail
+          rm -rf KernelSU-Next
+          # 完整克隆（--filter=blob:none 只是省流量，不是浅克隆）：
+          # KSU 版本号来自 git 历史，绝不能 --depth（见 KernelSU-Next更新指南.md 第 2 节）
+          if ! git clone --filter=blob:none "$KSU_REPO" KernelSU-Next; then
+            rm -rf KernelSU-Next
+            git clone "$KSU_REPO" KernelSU-Next
+          fi
+          git -C KernelSU-Next checkout -q --detach "$KSU_COMMIT"
+          echo "KernelSU-Next: $(git -C KernelSU-Next describe --tags)"
+          # 让主仓库不再把 submodule 指针差异当作「已修改」，避免内核版本串被加上 ++
+          git update-index --cacheinfo "160000,${KSU_COMMIT},KernelSU-Next" || true
+          git config diff.ignoreSubmodules all
+      - name: 编译内核
+        run: |
+          set -euo pipefail
+          export ARCH=arm64 SUBARCH=arm64 KBUILD_BUILD_USER=v KBUILD_BUILD_HOST=ginkgo
+          mkdir -p dist
+          # 与 .tmp/build.sh（本地验证过的组合）一致
+          MAKE_ARGS=(O=out ARCH=arm64 CC="ccache clang" CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            -j"$(nproc)")
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG" 2>&1 | tee dist/build-ginkgo.log
+          make "${MAKE_ARGS[@]}" 2>&1 | tee -a dist/build-ginkgo.log
+          ccache -s | tee -a dist/build-ginkgo.log
+      - name: 校验产物并提取版本（以编译日志为准）
+        id: verify
+        run: |
+          set -euo pipefail
+          B=out/arch/arm64/boot
+          for f in "$B/Image.gz" "$B/dtbo.img" "$B/dts/qcom/trinket.dtb" "$B/dts/qcom/trinket-iot.dtb" "$B/dts/qcom/trinketp-iot.dtb"; do
+            [ -f "$f" ] || { echo "错误: 缺少产物 $f" >&2; exit 1; }
+          done
+          grep -e '-- KernelSU-Next' -e 'Hook mode' dist/build-ginkgo.log || true
+          LOG_VERSION=$(sed -n 's/^-- KernelSU-Next version: //p' dist/build-ginkgo.log | tail -n1)
+          LOG_TAG=$(sed -n 's/^-- KernelSU-Next tag: //p' dist/build-ginkgo.log | tail -n1)
+          if [ -z "$LOG_VERSION" ]; then
+            echo "错误: 编译日志里没有 KSU 版本号——KernelSU-Next 可能不是独立 git 仓库（版本号会退回 1）" >&2
+            exit 1
+          fi
+          if [ "$LOG_VERSION" != "${{ needs.meta.outputs.ksu_version }}" ]; then
+            echo "::warning::编译日志 KSU 版本号 $LOG_VERSION 与预计算 ${{ needs.meta.outputs.ksu_version }} 不一致（上游公式可能已调整），以日志为准"
+          fi
+          grep -q 'Hook mode: Manual' dist/build-ginkgo.log || echo "::warning::日志中没有 'Hook mode: Manual'，请检查手动 hook 是否接好"
+          echo "version=$LOG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$LOG_TAG" >> "$GITHUB_OUTPUT"
+          echo "kernel_release=$(cat out/include/config/kernel.release)" >> "$GITHUB_OUTPUT"
+          echo "clang=$(clang --version | head -n1)" >> "$GITHUB_OUTPUT"
+      - name: 打包 AnyKernel3（Image.gz + dtb + dtbo.img，同源）
+        id: pack
+        run: |
+          set -euo pipefail
+          B=out/arch/arm64/boot
+          ZIP="PureCAF-ginkgo-KSUNext-${{ steps.verify.outputs.tag }}-${{ steps.verify.outputs.version }}-${{ needs.meta.outputs.date }}.zip"
+          git clone --depth=1 --branch "$ANYKERNEL_BRANCH" "$ANYKERNEL_REPO" ak
+          rm -f ak/Image.gz-dtb ak/dtbo.img
+          cp "$B/Image.gz" "$B/dtbo.img" ak/
+          cat "$B/dts/qcom/trinket.dtb" "$B/dts/qcom/trinket-iot.dtb" "$B/dts/qcom/trinketp-iot.dtb" > ak/dtb
+          sed -i "s/^kernel.string=.*/kernel.string=PureCAF + KernelSU-Next ${{ steps.verify.outputs.tag }} (built ${{ needs.meta.outputs.date }})/" ak/anykernel.sh
+          (cd ak && zip -r9q "../dist/$ZIP" . -x '.git/*' -x '.github/*' -x README.md -x '*placeholder')
+          rm -rf ak
+          (cd dist && sha256sum "$ZIP" > "$ZIP.sha256" && cat "$ZIP.sha256")
+          unzip -l "dist/$ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+      - name: 生成 build-info
+        env:
+          KERNEL_BRANCH: ${{ needs.meta.outputs.kernel_branch }}
+          KERNEL_COMMIT: ${{ needs.meta.outputs.kernel_commit }}
+          KERNEL_COMMIT_SHORT: ${{ needs.meta.outputs.kernel_short }}
+          KERNEL_COMMIT_SUBJECT: ${{ needs.meta.outputs.kernel_subject }}
+          KERNEL_COMMIT_DATE: ${{ needs.meta.outputs.kernel_date }}
+          KERNEL_VERSION_STRING: ${{ steps.verify.outputs.kernel_release }}
+          KERNEL_ZIP: ${{ steps.pack.outputs.zip }}
+          CLANG: ${{ steps.verify.outputs.clang }}
+          KSU_REF: ${{ needs.meta.outputs.ksu_ref }}
+          KSU_REF_NOTE: ${{ needs.meta.outputs.ksu_ref_note }}
+          KSU_COMMIT: ${{ needs.meta.outputs.ksu_commit }}
+          KSU_COMMIT_SHORT: ${{ needs.meta.outputs.ksu_short }}
+          KSU_COMMIT_DATE: ${{ needs.meta.outputs.ksu_commit_date }}
+          KSU_COUNT: ${{ needs.meta.outputs.ksu_count }}
+          KSU_DESCRIBE: ${{ needs.meta.outputs.ksu_describe }}
+          KSU_TAG_LOG: ${{ steps.verify.outputs.tag }}
+          KSU_VERSION_LOG: ${{ steps.verify.outputs.version }}
+          KSU_VERSION_META: ${{ needs.meta.outputs.ksu_version }}
+          KSU_TAG_EXACT: ${{ needs.meta.outputs.ksu_tag_exact }}
+          KSU_SINCE_TAG: ${{ needs.meta.outputs.ksu_since_tag }}
+          MANAGER_TAG: ${{ needs.meta.outputs.manager_tag }}
+          MANAGER_APK: ${{ needs.meta.outputs.manager_apk }}
+          MANAGER_APK_SPOOFED: ${{ needs.meta.outputs.manager_apk_spoofed }}
+          MANAGER_VERSION: ${{ needs.meta.outputs.manager_version }}
+          MANAGER_MIN_KERNEL: ${{ needs.meta.outputs.manager_min_kernel }}
+        run: |
+          set -euo pipefail
+          cat > dist/build-info-ginkgo.txt <<EOF
+          DEVICE=ginkgo
+          DEFCONFIG=${DEFCONFIG}
+          KERNEL_REPO=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+          KERNEL_BRANCH=${KERNEL_BRANCH}
+          KERNEL_COMMIT=${KERNEL_COMMIT}
+          KERNEL_COMMIT_SHORT=${KERNEL_COMMIT_SHORT}
+          KERNEL_COMMIT_SUBJECT=${KERNEL_COMMIT_SUBJECT}
+          KERNEL_COMMIT_DATE=${KERNEL_COMMIT_DATE}
+          KERNEL_VERSION_STRING=${KERNEL_VERSION_STRING}
+          KERNEL_ZIP=${KERNEL_ZIP}
+          CLANG=${CLANG}
+          KSU_REPO=https://github.com/KernelSU-Next/KernelSU-Next
+          KSU_REF=${KSU_REF}
+          KSU_REF_NOTE=${KSU_REF_NOTE}
+          KSU_COMMIT=${KSU_COMMIT}
+          KSU_COMMIT_SHORT=${KSU_COMMIT_SHORT}
+          KSU_COMMIT_DATE=${KSU_COMMIT_DATE}
+          KSU_COMMIT_COUNT=${KSU_COUNT}
+          KSU_TAG=${KSU_TAG_LOG}
+          KSU_DESCRIBE=${KSU_DESCRIBE}
+          KSU_VERSION=${KSU_VERSION_LOG}
+          KSU_VERSION_META=${KSU_VERSION_META}
+          KSU_TAG_EXACT=${KSU_TAG_EXACT}
+          KSU_COMMITS_SINCE_TAG=${KSU_SINCE_TAG}
+          MANAGER_TAG=${MANAGER_TAG}
+          MANAGER_APK=${MANAGER_APK}
+          MANAGER_APK_SPOOFED=${MANAGER_APK_SPOOFED}
+          MANAGER_VERSION=${MANAGER_VERSION}
+          MANAGER_MIN_KERNEL=${MANAGER_MIN_KERNEL}
+          BUILD_END=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          RUN_URL=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          cat dist/build-info-ginkgo.txt
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: purecaf-ginkgo-kernelsu-next
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/build-info-ginkgo.txt
+            dist/build-ginkgo.log
+
+  release:
+    name: 发布 Release
+    needs: [meta, build]
+    if: ${{ github.event_name == 'push' || inputs.publish_release }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: 生成 Release 说明
+        run: |
+          cat > /tmp/gen-release-notes.py <<'PY'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          """生成 PureCAF ginkgo 内核 Release 说明（release-notes.md）与 build-info.json。"""
+          import glob, hashlib, json, os, re, sys, urllib.request
+          from datetime import datetime, timezone
+
+          KSU_SLUG = "KernelSU-Next/KernelSU-Next"
+          KSU_HTML = "https://github.com/" + KSU_SLUG
+          NATIVES_PATH = "manager/app/src/main/java/com/rifsxd/ksunext/Natives.kt"
+          DEFAULT_MIN_KERNEL = "33188"
+          ART = "artifacts"
+
+          def parse_info(path):
+              info = {}
+              with open(path, encoding="utf-8", errors="replace") as fh:
+                  for line in fh:
+                      line = line.rstrip("\r\n")
+                      if not line or line.startswith("#") or "=" not in line:
+                          continue
+                      k, v = line.split("=", 1)
+                      info[k.strip()] = v.strip()
+              return info
+
+          def file_sha256(path):
+              h = hashlib.sha256()
+              size = 0
+              with open(path, "rb") as fh:
+                  while True:
+                      chunk = fh.read(1 << 20)
+                      if not chunk:
+                          break
+                      size += len(chunk)
+                      h.update(chunk)
+              return size, h.hexdigest()
+
+          def human(n):
+              return "%.2f MiB" % (n / 1048576.0)
+
+          def api_json(url):
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": "purecaf-ginkgo-release-notes",
+                  "Accept": "application/vnd.github+json"})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+          def releases_list():
+              try:
+                  data = api_json("https://api.github.com/repos/%s/releases?per_page=30" % KSU_SLUG)
+              except Exception as exc:
+                  sys.stderr.write("警告: 查询 KernelSU-Next releases 失败: %s\n" % exc)
+                  return []
+              out = []
+              for r in data if isinstance(data, list) else []:
+                  names = [a.get("name", "") for a in r.get("assets", [])]
+                  apks = [n for n in names if n.endswith("-release.apk")]
+                  plain = next((n for n in apks if "spoofed" not in n), "")
+                  spoof = next((n for n in apks if "spoofed" in n), "")
+                  m = re.search(r"_(\d+)-release\.apk$", plain or spoof)
+                  out.append({"tag": r.get("tag_name", ""), "url": r.get("html_url", ""),
+                              "apk": plain, "apk_spoofed": spoof,
+                              "version_code": m.group(1) if m else ""})
+              return out
+
+          def min_kernel_for(tag):
+              if not tag:
+                  return ""
+              url = "https://raw.githubusercontent.com/%s/%s/%s" % (KSU_SLUG, tag, NATIVES_PATH)
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as resp:
+                      text = resp.read().decode("utf-8", "replace")
+                  m = re.search(r"MINIMAL_SUPPORTED_KERNEL\s*=\s*(\d+)", text)
+                  return m.group(1) if m else ""
+              except Exception:
+                  return ""
+
+          def compat(min_k, ver):
+              try:
+                  return "✓ 满足" if int(ver) >= int(min_k) else "⚠ 低于最低要求，请换更旧的管理器"
+              except ValueError:
+                  return "（无法比较）"
+
+          def main():
+              info_path = os.path.join(ART, "build-info-ginkgo.txt")
+              if not os.path.isfile(info_path):
+                  sys.stderr.write("错误: 找不到 %s\n" % info_path)
+                  return 1
+              info = parse_info(info_path)
+              files = []
+              for p in sorted(glob.glob(os.path.join(ART, "*.zip"))):
+                  size, sha = file_sha256(p)
+                  files.append({"name": os.path.basename(p), "size": size, "sha256": sha})
+
+              ksu_ver = info.get("KSU_VERSION", "?")
+              min_k = info.get("MANAGER_MIN_KERNEL", DEFAULT_MIN_KERNEL)
+              rels = releases_list()
+              exact = next((r for r in rels if str(r.get("version_code", "")) == str(ksu_ver)), None)
+              latest = rels[0] if rels else None
+              exact_min = min_kernel_for(exact["tag"]) if exact else ""
+
+              L = []
+              add = L.append
+              add("# PureCAF ginkgo · KernelSU-Next %s (%s)" % (info.get("KSU_TAG", "?"), ksu_ver))
+              add("")
+              add("> GitHub Actions 一键构建 · 完成于 %s" % info.get("BUILD_END", "?"))
+              if info.get("RUN_URL"):
+                  add("> 构建日志：[Actions run](%s)" % info["RUN_URL"])
+              add("")
+              add("## 一、内核信息")
+              add("")
+              add("| 项 | 值 |")
+              add("|---|---|")
+              add("| 内核 | PureCAF（CAF 4.14 · ginkgo / willow · MIUI 12.5） |")
+              add("| 仓库 / 分支 | %s · `%s` |" % (info.get("KERNEL_REPO", ""), info.get("KERNEL_BRANCH", "")))
+              add("| 提交 | `%s` %s（%s） |" % (info.get("KERNEL_COMMIT_SHORT", "?"),
+                                                info.get("KERNEL_COMMIT_SUBJECT", ""),
+                                                info.get("KERNEL_COMMIT_DATE", "")))
+              add("| 内核版本串 | `%s` |" % info.get("KERNEL_VERSION_STRING", "?"))
+              add("| 编译工具链 | %s |" % info.get("CLANG", "?"))
+              add("")
+              add("## 二、KernelSU-Next")
+              add("")
+              add("| 项 | 值 |")
+              add("|---|---|")
+              add("| 仓库 | %s |" % KSU_HTML)
+              add("| 引用 | %s → `%s` |" % (info.get("KSU_REF_NOTE", ""), info.get("KSU_REF", "")))
+              add("| 提交 | `%s`（%s） |" % (info.get("KSU_COMMIT_SHORT", "?"), info.get("KSU_COMMIT_DATE", "")))
+              add("| 基线 tag | `%s`（describe：`%s`，tag 之后 %s 个提交） |" % (
+                  info.get("KSU_TAG", "?"), info.get("KSU_DESCRIBE", "?"), info.get("KSU_COMMITS_SINCE_TAG", "?")))
+              add("| KSU 版本号 | **%s** |" % ksu_ver)
+              add("| hook 模式 | 手动 hook（`CONFIG_KSU_MANUAL_HOOK=y`，4.14 non-GKI） |")
+              add("")
+              if info.get("KSU_TAG_EXACT") != "yes":
+                  add("> ⚠️ **注意**：本次使用的 KernelSU-Next 提交不在任何已发布 tag 上"
+                      "（`KSU_REF=%s`），可能未经 KernelSU-Next 作者发布/测试，请自行评估风险。"
+                      % info.get("KSU_REF", ""))
+                  add("")
+              if info.get("KSU_VERSION") != info.get("KSU_VERSION_META"):
+                  add("> ℹ️ 版本号取自编译日志（%s），与预计算值（%s）不同：上游版本公式可能已调整。"
+                      % (info.get("KSU_VERSION"), info.get("KSU_VERSION_META")))
+                  add("")
+              add("## 三、配套管理器 APK")
+              add("")
+              if exact:
+                  add("- **精确匹配（推荐）**：[%s](%s) 的 **`%s`**（versionCode `%s`，与内核 KSU 版本号一致）"
+                      % (exact.get("tag", "?"), exact.get("url", KSU_HTML),
+                         exact.get("apk") or "?", exact.get("version_code")))
+                  if exact.get("apk_spoofed"):
+                      add("- 去伪装包（应用包名不同，用于规避检测）：`%s`" % exact["apk_spoofed"])
+                  if exact_min:
+                      add("- 该版本最低支持内核：`%s` → 本内核 `%s` %s" % (exact_min, ksu_ver, compat(exact_min, ksu_ver)))
+              if latest and (not exact or latest.get("tag") != exact.get("tag")):
+                  add("- 最新 release：[%s](%s) → `%s`（versionCode `%s`）" % (
+                      latest.get("tag", "?"), latest.get("url", KSU_HTML),
+                      latest.get("apk") or "?", latest.get("version_code", "?")))
+                  if min_k:
+                      add("- 最新管理器最低支持内核：`%s` → 本内核 `%s` %s" % (min_k, ksu_ver, compat(min_k, ksu_ver)))
+              if not exact and not latest:
+                  add("- 未取到 release 信息，请到 [KernelSU-Next Releases](%s/releases) 下载管理器 APK。" % KSU_HTML)
+              add("")
+              add("本内核只认 KernelSU-Next 官方签名（第三方重签名的管理器不可用）。"
+                  "管理器首页显示的内核版本号应与上面的 **%s** 一致。" % ksu_ver)
+              add("")
+              add("## 四、产物文件")
+              add("")
+              add("| 文件 | 大小 | SHA256 |")
+              add("|---|---|---|")
+              for f in files:
+                  add("| `%s` | %s | `%s` |" % (f["name"], human(f["size"]), f["sha256"]))
+              add("")
+              add("（另有同名 `.sha256` 校验文件与 `build-info-ginkgo.txt` 构建信息。）")
+              add("")
+              add("## 五、刷入步骤（TWRP）")
+              add("")
+              add("1. 刷前先备份：TWRP → Backup，至少勾选 **Boot + DTBO**（建议 vbmeta / EFS / Persist）。")
+              add("2. TWRP → Install 选择上面的 zip 刷入，然后重启系统（第一次开机稍慢）。")
+              add("   - 包内是 `Image.gz` + boot 的 `dtb` 段 + `dtbo.img`，三者来自同一次编译。"
+                  "MIUI 12.5 的 boot 是 header v2，只替换内核会开机硬复位，所以必须整包刷。")
+              add("   - 只写 boot 和 dtbo 分区，保留原 ramdisk；**不要与 Magisk 混用**（两个 root 方案会冲突）。")
+              add("3. 开机后安装上面推荐的管理器 APK，打开显示「工作中 / Working」即为成功。")
+              add("4. 模块导致卡开机时：开机过程中连按音量下键 3 次以上，进入 KernelSU-Next 安全模式。")
+              add("")
+              add("## 六、出问题恢复")
+              add("")
+              add("- TWRP → Restore 恢复备份的 Boot + DTBO；或 fastboot："
+                  "`fastboot flash boot boot.img && fastboot flash dtbo dtbo.img`。")
+              add("")
+              add("## 七、如何复现")
+              add("")
+              add("- 本仓库 **Actions → Build kernel (KernelSU-Next) → Run workflow**，"
+                  "`ksu_ref` 留空（= 自动取 legacy 分支最新 tag，即本次的 `%s`），勾选发布即可。"
+                  % info.get("KSU_TAG", "?"))
+              add("- 工具链与本地 `.tmp/build.sh` 相同：clang r383902b1 + GCC 4.9；"
+                  "打包规则见 `.tmp/KernelSU-Next更新指南.md` 第 6 节。")
+              add("")
+
+              with open(os.path.join(ART, "release-notes.md"), "w", encoding="utf-8") as fh:
+                  fh.write("\n".join(L) + "\n")
+
+              payload = {
+                  "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                  "kernel": {k: info.get(k, "") for k in (
+                      "KERNEL_REPO", "KERNEL_BRANCH", "KERNEL_COMMIT", "KERNEL_COMMIT_SHORT",
+                      "KERNEL_COMMIT_DATE", "KERNEL_VERSION_STRING", "KERNEL_ZIP", "CLANG")},
+                  "kernelsu_next": {k: info.get(k, "") for k in (
+                      "KSU_REPO", "KSU_REF", "KSU_COMMIT", "KSU_COMMIT_SHORT", "KSU_COMMIT_DATE",
+                      "KSU_COMMIT_COUNT", "KSU_TAG", "KSU_DESCRIBE", "KSU_VERSION",
+                      "KSU_TAG_EXACT", "KSU_COMMITS_SINCE_TAG")},
+                  "manager": {"release_tag": info.get("MANAGER_TAG", ""),
+                              "apk": info.get("MANAGER_APK", ""),
+                              "apk_spoofed": info.get("MANAGER_APK_SPOOFED", ""),
+                              "version_code": info.get("MANAGER_VERSION", ""),
+                              "min_supported_kernel": min_k},
+                  "artifacts": files,
+              }
+              with open(os.path.join(ART, "build-info.json"), "w", encoding="utf-8") as fh:
+                  json.dump(payload, fh, ensure_ascii=False, indent=2)
+                  fh.write("\n")
+              print("已生成 artifacts/release-notes.md 与 artifacts/build-info.json")
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+          python3 /tmp/gen-release-notes.py
+          echo "::group::Release 说明预览"
+          cat artifacts/release-notes.md
+          echo "::endgroup::"
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ needs.meta.outputs.release_tag }}
+          name: PureCAF ginkgo · KernelSU-Next ${{ needs.build.outputs.ksu_tag || needs.meta.outputs.ksu_tag }} (${{ needs.build.outputs.ksu_version || needs.meta.outputs.ksu_version }})
+          body_path: artifacts/release-notes.md
+          files: |
+            artifacts/*.zip
+            artifacts/*.sha256
+            artifacts/build-info-ginkgo.txt
+            artifacts/build-info.json
+          fail_on_unmatched_files: true
+          make_latest: true
+          draft: false

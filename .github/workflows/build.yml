@@ -5,7 +5,6 @@ env:
 
 on:
   workflow_dispatch:
-  push:
 
 jobs:
   Set-repos:
