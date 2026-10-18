@@ -55,6 +55,18 @@
 #define SCM_SVC_SEC_WDOG_DIS	0x7
 #define MAX_CPU_CTX_SIZE	2048
 
+/*
+ * Maximum time to wait for other CPUs to acknowledge a watchdog IPI ping.
+ * The IPI round trip normally completes in well under a millisecond, but a
+ * CPU can be missed by cpu_idle_pc_state[] (e.g. it is stuck with IRQs
+ * disabled, or in a low power state we did not observe) and then never
+ * responds. The hardware watchdog barks shortly after pet_time expires, so
+ * blocking here forever would make the pet thread miss its deadline and
+ * reset the device even though nothing is actually wrong. Bail out after
+ * this timeout and pet anyway - petting is more important than the ping.
+ */
+#define PING_CPU_TIMEOUT_MS	250
+
 static struct msm_watchdog_data *wdog_data;
 
 static int cpu_idle_pc_state[NR_CPUS];
@@ -401,6 +413,7 @@ static DEFINE_PER_CPU_SHARED_ALIGNED(call_single_data_t, csd_data);
 static void ping_other_cpus(struct msm_watchdog_data *wdog_dd)
 {
 	unsigned long online_mask, ping_mask = 0;
+	unsigned long deadline;
 	unsigned int final_alive_mask;
 	int cpu, this_cpu;
 
@@ -427,13 +440,28 @@ static void ping_other_cpus(struct msm_watchdog_data *wdog_dd)
 	preempt_enable();
 
 	atomic_set(&wdog_dd->pinged_mask, final_alive_mask);
-	while (1) {
-		set_current_state(TASK_UNINTERRUPTIBLE);
-		if (atomic_read(&wdog_dd->alive_mask) == final_alive_mask)
+
+	/*
+	 * Wait for the pinged CPUs to acknowledge, but never longer than
+	 * PING_CPU_TIMEOUT_MS. keep_alive_response() wakes us as soon as the
+	 * last CPU has acked, so the normal case is a very short sleep. If a
+	 * CPU never acks we must still return so that the pet below is not
+	 * missed (which would trigger a bark/bite reboot).
+	 */
+	deadline = jiffies + msecs_to_jiffies(PING_CPU_TIMEOUT_MS);
+	while (atomic_read(&wdog_dd->alive_mask) != final_alive_mask) {
+		if (time_after_eq(jiffies, deadline))
 			break;
-		schedule();
+		set_current_state(TASK_UNINTERRUPTIBLE);
+		schedule_timeout(1);
 	}
 	__set_current_state(TASK_RUNNING);
+
+	if (atomic_read(&wdog_dd->alive_mask) != final_alive_mask)
+		pr_warn("watchdog: CPU ping timed out, unresponsive CPUs: 0x%x (alive_mask=0x%x pinged_mask=0x%x)\n",
+			final_alive_mask & ~atomic_read(&wdog_dd->alive_mask),
+			atomic_read(&wdog_dd->alive_mask),
+			atomic_read(&wdog_dd->pinged_mask));
 }
 
 static void pet_task_wakeup(unsigned long data)
